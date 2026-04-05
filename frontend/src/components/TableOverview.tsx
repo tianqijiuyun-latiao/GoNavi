@@ -4,6 +4,7 @@ import { TableOutlined, SearchOutlined, ReloadOutlined, SortAscendingOutlined, D
 import { useStore } from '../store';
 import { DBQuery, DBShowCreateTable, ExportTable, DropTable, RenameTable } from '../../wailsjs/go/app/App';
 import type { TabData } from '../types';
+import { useAutoFetchVisibility } from '../utils/autoFetchVisibility';
 import { buildRpcConnectionConfig } from '../utils/connectionRpcConfig';
 
 interface TableOverviewProps {
@@ -151,6 +152,7 @@ const TableOverview: React.FC<TableOverviewProps> = ({ tab }) => {
     const [viewMode, setViewMode] = useState<ViewMode>('card');
 
     const connection = useMemo(() => connections.find(c => c.id === tab.connectionId), [connections, tab.connectionId]);
+    const autoFetchVisible = useAutoFetchVisibility();
 
     const loadData = useCallback(async () => {
         if (!connection) return;
@@ -179,7 +181,12 @@ const TableOverview: React.FC<TableOverviewProps> = ({ tab }) => {
         }
     }, [connection, tab.dbName]);
 
-    useEffect(() => { loadData(); }, [loadData]);
+    useEffect(() => {
+        if (!autoFetchVisible) {
+            return;
+        }
+        void loadData();
+    }, [autoFetchVisible, loadData]);
 
     const sortedFiltered = useMemo(() => {
         let list = [...tables];

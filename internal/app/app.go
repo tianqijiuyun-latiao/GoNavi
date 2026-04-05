@@ -23,6 +23,7 @@ import (
 )
 
 const dbCachePingInterval = 30 * time.Second
+const dbConnectFailureCooldown = 30 * time.Second
 
 const (
 	startupConnectRetryWindow   = 20 * time.Second
@@ -40,6 +41,11 @@ type cachedDatabase struct {
 	lastPing time.Time
 }
 
+type cachedConnectFailure struct {
+	occurredAt time.Time
+	err        error
+}
+
 type queryContext struct {
 	cancel  context.CancelFunc
 	started time.Time
@@ -50,6 +56,7 @@ type App struct {
 	ctx            context.Context
 	startedAt      time.Time
 	dbCache        map[string]cachedDatabase // Cache for DB connections
+	connectFailures map[string]cachedConnectFailure
 	mu             sync.RWMutex              // Mutex for cache access
 	updateMu       sync.Mutex
 	updateState    updateState
@@ -70,6 +77,7 @@ func NewAppWithSecretStore(store secretstore.SecretStore) *App {
 	}
 	return &App{
 		dbCache:        make(map[string]cachedDatabase),
+		connectFailures: make(map[string]cachedConnectFailure),
 		runningQueries: make(map[string]queryContext),
 		configDir:      resolveAppConfigDir(),
 		secretStore:    store,
@@ -573,14 +581,28 @@ func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing 
 	if isFileDB {
 		logger.Infof("未命中文件库连接缓存，开始创建连接：类型=%s 缓存Key=%s", strings.TrimSpace(effectiveConfig.Type), shortKey)
 	}
+	if failure, remaining, ok := a.getCachedConnectFailureByKey(key); ok {
+		message := fmt.Sprintf("连接最近失败，正在冷却中，请 %s 后重试；上次错误：%s",
+			formatConnectFailureCooldown(remaining),
+			normalizeErrorMessage(failure.err),
+		)
+		logger.Warnf("命中数据库连接失败冷却：%s 缓存Key=%s 剩余=%s 原因=%s",
+			formatConnSummary(effectiveConfig), shortKey, formatConnectFailureCooldown(remaining), normalizeErrorMessage(failure.err))
+		return nil, withLogHint{err: fmt.Errorf("%s", message), logPath: logger.Path()}
+	}
 
+	initialKey := key
 	dbInst, connectedConfig, err := a.connectDatabaseWithStartupRetry(resolvedConfig)
 	if err != nil {
+		failedKey := getCacheKey(connectedConfig)
+		a.recordConnectFailureByKey(failedKey, err)
 		return nil, err
 	}
+	a.clearConnectFailureByKey(initialKey)
 	effectiveConfig = connectedConfig
 	key = getCacheKey(effectiveConfig)
 	shortKey = shortenCacheKey(key)
+	a.clearConnectFailureByKey(key)
 
 	now := time.Now()
 
@@ -599,6 +621,62 @@ func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing 
 
 	logger.Infof("数据库连接成功并写入缓存：%s 缓存Key=%s", formatConnSummary(effectiveConfig), shortKey)
 	return dbInst, nil
+}
+
+func (a *App) getCachedConnectFailureByKey(key string) (cachedConnectFailure, time.Duration, bool) {
+	if a == nil || strings.TrimSpace(key) == "" {
+		return cachedConnectFailure{}, 0, false
+	}
+
+	a.mu.RLock()
+	entry, exists := a.connectFailures[key]
+	a.mu.RUnlock()
+	if !exists || entry.err == nil || entry.occurredAt.IsZero() {
+		return cachedConnectFailure{}, 0, false
+	}
+
+	remaining := dbConnectFailureCooldown - time.Since(entry.occurredAt)
+	if remaining <= 0 {
+		a.clearConnectFailureByKey(key)
+		return cachedConnectFailure{}, 0, false
+	}
+
+	return entry, remaining, true
+}
+
+func (a *App) recordConnectFailureByKey(key string, err error) {
+	if a == nil || strings.TrimSpace(key) == "" || err == nil {
+		return
+	}
+
+	a.mu.Lock()
+	if a.connectFailures == nil {
+		a.connectFailures = make(map[string]cachedConnectFailure)
+	}
+	a.connectFailures[key] = cachedConnectFailure{
+		occurredAt: time.Now(),
+		err:        err,
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) clearConnectFailureByKey(key string) {
+	if a == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+
+	a.mu.Lock()
+	if a.connectFailures != nil {
+		delete(a.connectFailures, key)
+	}
+	a.mu.Unlock()
+}
+
+func formatConnectFailureCooldown(remaining time.Duration) time.Duration {
+	if remaining <= time.Second {
+		return time.Second
+	}
+	return remaining.Truncate(time.Second)
 }
 
 func shortenCacheKey(key string) string {

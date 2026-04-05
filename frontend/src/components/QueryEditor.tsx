@@ -11,6 +11,7 @@ import DataGrid, { GONAVI_ROW_KEY } from './DataGrid';
 import { getDataSourceCapabilities } from '../utils/dataSourceCapabilities';
 import { convertMongoShellToJsonCommand } from '../utils/mongodb';
 import { getShortcutDisplay, isEditableElement, isShortcutMatch } from '../utils/shortcuts';
+import { useAutoFetchVisibility } from '../utils/autoFetchVisibility';
 import { buildRpcConnectionConfig } from '../utils/connectionRpcConfig';
 
 const SQL_KEYWORDS = [
@@ -249,6 +250,7 @@ const QueryEditor: React.FC<{ tab: TabData; isActive?: boolean }> = ({ tab, isAc
   const setQueryOptions = useStore(state => state.setQueryOptions);
   const shortcutOptions = useStore(state => state.shortcutOptions);
   const activeTabId = useStore(state => state.activeTabId);
+  const autoFetchVisible = useAutoFetchVisibility();
 
   const currentSavedQuery = useMemo(() => {
       const savedId = String(tab.savedQueryId || '').trim();
@@ -324,6 +326,10 @@ const QueryEditor: React.FC<{ tab: TabData; isActive?: boolean }> = ({ tab, isAc
 
   // Fetch Database List
   useEffect(() => {
+      if (!autoFetchVisible) {
+          return;
+      }
+
       const fetchDbs = async () => {
           const conn = connections.find(c => c.id === currentConnectionId);
           if (!conn) return;
@@ -367,10 +373,14 @@ const QueryEditor: React.FC<{ tab: TabData; isActive?: boolean }> = ({ tab, isAc
           }
       };
       void fetchDbs();
-  }, [currentConnectionId, connections]);
+  }, [autoFetchVisible, currentConnectionId, connections]);
 
   // Fetch Metadata for Autocomplete (Cross-database)
   useEffect(() => {
+      if (!autoFetchVisible) {
+          return;
+      }
+
       const fetchMetadata = async () => {
           const conn = connections.find(c => c.id === currentConnectionId);
           if (!conn) return;
@@ -424,7 +434,7 @@ const QueryEditor: React.FC<{ tab: TabData; isActive?: boolean }> = ({ tab, isAc
           }
       };
       void fetchMetadata();
-  }, [currentConnectionId, connections, dbList]); // dbList 变化时触发重新加载
+  }, [autoFetchVisible, currentConnectionId, connections, dbList]); // dbList 变化时触发重新加载
 
   // Query ID management helpers
   const setQueryId = (id: string) => {

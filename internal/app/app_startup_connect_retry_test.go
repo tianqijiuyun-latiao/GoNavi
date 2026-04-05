@@ -303,3 +303,167 @@ func TestIsTransientStartupConnectError(t *testing.T) {
 		t.Fatal("expected authentication failure to not be treated as transient startup connect error")
 	}
 }
+
+func TestGetDatabaseWithPing_CoolsDownRepeatedFailures(t *testing.T) {
+	originalNewDatabaseFunc := newDatabaseFunc
+	originalResolveDialConfigWithProxyFunc := resolveDialConfigWithProxyFunc
+	defer func() {
+		newDatabaseFunc = originalNewDatabaseFunc
+		resolveDialConfigWithProxyFunc = originalResolveDialConfigWithProxyFunc
+	}()
+
+	connectCalls := 0
+	newDatabaseFunc = func(dbType string) (db.Database, error) {
+		return &fakeStartupRetryDB{
+			connect: func(config connection.ConnectionConfig) error {
+				connectCalls++
+				return errors.New("dial tcp 10.1.131.86:5432: connect: connection refused")
+			},
+		}, nil
+	}
+	resolveDialConfigWithProxyFunc = func(raw connection.ConnectionConfig) (connection.ConnectionConfig, error) {
+		return raw, nil
+	}
+
+	a := &App{
+		startedAt:      time.Now().Add(-startupConnectRetryWindow - time.Second),
+		dbCache:        make(map[string]cachedDatabase),
+		connectFailures: make(map[string]cachedConnectFailure),
+		runningQueries: make(map[string]queryContext),
+	}
+	config := connection.ConnectionConfig{Type: "postgres", Host: "10.1.131.86", Port: 5432, User: "postgres"}
+
+	_, firstErr := a.getDatabaseWithPing(config, false)
+	if firstErr == nil {
+		t.Fatal("expected first connection attempt to fail")
+	}
+	if connectCalls != 2 {
+		t.Fatalf("expected first request to use 2 connect attempts, got %d", connectCalls)
+	}
+
+	_, secondErr := a.getDatabaseWithPing(config, false)
+	if secondErr == nil {
+		t.Fatal("expected second connection attempt to fail during cooldown")
+	}
+	if connectCalls != 2 {
+		t.Fatalf("expected repeated request during cooldown to avoid reconnecting, got %d connect attempts", connectCalls)
+	}
+}
+
+func TestGetDatabaseWithPing_AllowsRetryAfterFailureCooldown(t *testing.T) {
+	originalNewDatabaseFunc := newDatabaseFunc
+	originalResolveDialConfigWithProxyFunc := resolveDialConfigWithProxyFunc
+	defer func() {
+		newDatabaseFunc = originalNewDatabaseFunc
+		resolveDialConfigWithProxyFunc = originalResolveDialConfigWithProxyFunc
+	}()
+
+	connectCalls := 0
+	newDatabaseFunc = func(dbType string) (db.Database, error) {
+		return &fakeStartupRetryDB{
+			connect: func(config connection.ConnectionConfig) error {
+				connectCalls++
+				if connectCalls <= 2 {
+					return errors.New("dial tcp 10.1.131.86:5432: connect: connection refused")
+				}
+				return nil
+			},
+		}, nil
+	}
+	resolveDialConfigWithProxyFunc = func(raw connection.ConnectionConfig) (connection.ConnectionConfig, error) {
+		return raw, nil
+	}
+
+	a := &App{
+		startedAt:      time.Now().Add(-startupConnectRetryWindow - time.Second),
+		dbCache:        make(map[string]cachedDatabase),
+		connectFailures: make(map[string]cachedConnectFailure),
+		runningQueries: make(map[string]queryContext),
+	}
+	config := connection.ConnectionConfig{Type: "postgres", Host: "10.1.131.86", Port: 5432, User: "postgres"}
+
+	_, firstErr := a.getDatabaseWithPing(config, false)
+	if firstErr == nil {
+		t.Fatal("expected first connection attempt to fail")
+	}
+	if connectCalls != 2 {
+		t.Fatalf("expected first request to use 2 connect attempts, got %d", connectCalls)
+	}
+
+	key := getCacheKey(config)
+	a.mu.Lock()
+	a.connectFailures[key] = cachedConnectFailure{
+		occurredAt: time.Now().Add(-dbConnectFailureCooldown - time.Second),
+		err:        errors.New("dial tcp 10.1.131.86:5432: connect: connection refused"),
+	}
+	a.mu.Unlock()
+
+	inst, secondErr := a.getDatabaseWithPing(config, false)
+	if secondErr != nil {
+		t.Fatalf("expected retry after cooldown to be allowed, got error: %v", secondErr)
+	}
+	if inst == nil {
+		t.Fatal("expected database instance after cooldown retry")
+	}
+	if connectCalls != 3 {
+		t.Fatalf("expected reconnect after cooldown expiration, got %d connect attempts", connectCalls)
+	}
+}
+
+func TestGetDatabaseWithPing_ClearsFailureCooldownAfterSuccess(t *testing.T) {
+	originalNewDatabaseFunc := newDatabaseFunc
+	originalResolveDialConfigWithProxyFunc := resolveDialConfigWithProxyFunc
+	defer func() {
+		newDatabaseFunc = originalNewDatabaseFunc
+		resolveDialConfigWithProxyFunc = originalResolveDialConfigWithProxyFunc
+	}()
+
+	connectCalls := 0
+	newDatabaseFunc = func(dbType string) (db.Database, error) {
+		return &fakeStartupRetryDB{
+			connect: func(config connection.ConnectionConfig) error {
+				connectCalls++
+				if connectCalls <= 2 {
+					return errors.New("dial tcp 10.1.131.86:5432: connect: connection refused")
+				}
+				return nil
+			},
+		}, nil
+	}
+	resolveDialConfigWithProxyFunc = func(raw connection.ConnectionConfig) (connection.ConnectionConfig, error) {
+		return raw, nil
+	}
+
+	a := &App{
+		startedAt:      time.Now().Add(-startupConnectRetryWindow - time.Second),
+		dbCache:        make(map[string]cachedDatabase),
+		connectFailures: make(map[string]cachedConnectFailure),
+		runningQueries: make(map[string]queryContext),
+	}
+	config := connection.ConnectionConfig{Type: "postgres", Host: "10.1.131.86", Port: 5432, User: "postgres"}
+
+	_, firstErr := a.getDatabaseWithPing(config, false)
+	if firstErr == nil {
+		t.Fatal("expected first connection attempt to fail")
+	}
+
+	key := getCacheKey(config)
+	a.mu.Lock()
+	a.connectFailures[key] = cachedConnectFailure{
+		occurredAt: time.Now().Add(-dbConnectFailureCooldown - time.Second),
+		err:        errors.New("dial tcp 10.1.131.86:5432: connect: connection refused"),
+	}
+	a.mu.Unlock()
+
+	_, secondErr := a.getDatabaseWithPing(config, false)
+	if secondErr != nil {
+		t.Fatalf("expected retry after cooldown to succeed, got error: %v", secondErr)
+	}
+
+	a.mu.RLock()
+	_, exists := a.connectFailures[key]
+	a.mu.RUnlock()
+	if exists {
+		t.Fatal("expected successful connection to clear cached failure cooldown")
+	}
+}
